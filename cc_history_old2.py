@@ -106,62 +106,14 @@ def has_tool_result(content) -> bool:
               for b in as_blocks(content))
 
 
-import re
-
-# Wrapper tags Claude Code prepends to real prompts. Strip these, keep what's left.
-_TAG_RE = re.compile(
-    r"<(system-reminder|local-command-caveat|command-name|command-message|"
-    r"command-args|local-command-stdout|local-command-stderr|bash-input|"
-    r"bash-stdout|bash-stderr)>.*?</\1>",
-    re.DOTALL,
-)
-# Self-closing / unclosed variants of the same tags.
-_TAG_OPEN_RE = re.compile(
-    r"</?(system-reminder|local-command-caveat|command-name|command-message|"
-    r"command-args|local-command-stdout|local-command-stderr|bash-input|"
-    r"bash-stdout|bash-stderr)>",
-)
-# Auto-compaction preamble: Claude Code may append the user's next real prompt
-# after the injected summary, so cut the summary and keep any trailing prompt.
-_COMPACT_RE = re.compile(
-    r"^This session is being continued from a previous conversation.*?"
-    r"(?:\n\s*(?:Please continue|Continue)[^\n]*\n?)?",
-    re.DOTALL,
-)
-# Messages that are purely system plumbing, with no user content to recover.
-_PURE_NOISE = ("[Request interrupted by user", "API Error", "Caveat:")
-
-
-def clean_prompt(txt: str) -> str:
-    """Strip system wrappers/preambles and return the user's actual prompt text.
-    Returns '' if nothing real remains."""
-    t = _TAG_RE.sub("", txt)
-    t = _TAG_OPEN_RE.sub("", t)
-    t = t.strip()
-
-    if t.startswith("This session is being continued from a previous conversation"):
-        # Claude Code may append the user's next real prompt after the injected
-        # summary. Keep only text after the final "Please continue..." line; if
-        # there is none, the whole message is just the summary -> drop it.
-        m = None
-        for m in re.finditer(r"(?im)^\s*(?:please\s+)?continue[^\n]*$", t):
-            pass  # take the LAST such line
-        t = t[m.end():].strip() if m else ""
-        if not t:
-            return ""
-
-    if not t or t.startswith(_PURE_NOISE):
-        return ""
-    return t
-
-
 def is_real_prompt(e) -> bool:
     if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain"):
         return False
     content = (e.get("message") or {}).get("content")
     if has_tool_result(content):
         return False
-    return bool(clean_prompt(text_of(content)))
+    txt = text_of(content).strip()
+    return bool(txt) and not txt.startswith(NOISE_PREFIXES)
 
 
 def is_assistant(e) -> bool:
@@ -210,7 +162,7 @@ def session_title(entries, fallback=""):
         if e.get("type") == "summary" and e.get("summary"):
             summaries.append((e.get("leafUuid"), e["summary"]))
         if first_prompt is None and is_real_prompt(e):
-            first_prompt = clean_prompt(text_of((e.get("message") or {}).get("content")))
+            first_prompt = text_of((e.get("message") or {}).get("content")).strip()
     if custom:
         return _clean_title(custom)
     best, best_pos = None, -1
@@ -238,16 +190,15 @@ def extract_exchanges(files, full, seen_prompts):
                 if cur:
                     exchanges.append(cur)
                     cur = None
-                msg = e.get("message") or {}
-                prompt = clean_prompt(text_of(msg.get("content")))
-                ts = e.get("timestamp", "")
-                # Dedupe on content+timestamp, NOT uuid: Claude Code reuses/replays
-                # uuids across resumed sessions, which made uuid dedupe eat real prompts.
-                key = (prompt, ts)
-                if key in seen_prompts:
+                uid = e.get("uuid")
+                if uid in seen_prompts:
                     continue
-                seen_prompts.add(key)
-                cur = {"prompt": prompt, "ts": ts, "session": title,
+                if uid:
+                    seen_prompts.add(uid)
+                msg = e.get("message") or {}
+                cur = {"prompt": text_of(msg.get("content")).strip(),
+                       "ts": e.get("timestamp", ""),
+                       "session": title,
                        "steps": [], "final": ""}
             elif is_assistant(e) and cur is not None:
                 t = text_of((e.get("message") or {}).get("content")).strip()
@@ -315,17 +266,13 @@ def doc_header(title, full) -> str:
 def load_state(p: Path):
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
-        # keys are [prompt, ts] pairs in JSON -> restore as tuples
-        seen = {tuple(k) if isinstance(k, list) else k for k in d.get("seen", [])}
-        return seen, int(d.get("count", 0))
+        return set(d.get("seen", [])), int(d.get("count", 0))
     except Exception:
         return set(), 0
 
 
 def save_state(p: Path, seen, count):
-    p.write_text(json.dumps({"seen": [list(k) if isinstance(k, tuple) else k
-                                      for k in sorted(seen)],
-                             "count": count}), encoding="utf-8")
+    p.write_text(json.dumps({"seen": sorted(seen), "count": count}), encoding="utf-8")
 
 
 # ---- cross-platform advisory lock (serializes concurrent writers) -----------
@@ -373,7 +320,7 @@ def run_regenerate(args):
     title = args.title or friendly(proj.name)
     seen = set()
     ex = extract_exchanges(session_files(proj), args.full_response, seen)
-    out = resolve_out(args)
+    out = Path(args.out) if args.out else Path.cwd() / "claude-history.md"
     state_path = out.with_suffix(out.suffix + ".state")
     with file_lock(out):
         out.write_text(render_doc(ex, title, args.full_response), encoding="utf-8")
@@ -424,24 +371,6 @@ def resolve_transcript(args) -> Path:
         "hook (which provides transcript_path on stdin).")
 
 
-def machine_name() -> str:
-    """Short, filesystem-safe hostname for this computer."""
-    import socket
-    h = socket.gethostname().split(".")[0]
-    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in h).strip("-")
-    return safe or "machine"
-
-
-def resolve_out(args) -> Path:
-    """Output path, optionally suffixed with the hostname (--machine)."""
-    out = Path(args.out) if args.out else Path.cwd() / "claude-history.md"
-    if getattr(args, "machine", False):
-        suffix = f"-{machine_name()}"
-        if not out.stem.endswith(suffix):
-            out = out.with_name(f"{out.stem}{suffix}{out.suffix}")
-    return out
-
-
 def rotate_if_needed(out: Path, max_mb):
     """If the live doc has reached max_mb, archive it with a timestamp so a fresh
     file starts. Called under the lock. State is untouched, so numbering/dedupe
@@ -466,7 +395,7 @@ def rotate_if_needed(out: Path, max_mb):
 
 def run_append(args):
     transcript = resolve_transcript(args)
-    out = resolve_out(args)
+    out = Path(args.out) if args.out else Path.cwd() / "claude-history.md"
     state_path = Path(args.state) if args.state else out.with_suffix(out.suffix + ".state")
     title = args.title or friendly(transcript.parent.name)
 
@@ -498,10 +427,6 @@ def main():
     ap.add_argument("--project", help="[regenerate] absolute path of the project (default: current dir)")
     ap.add_argument("--project-dir", help="[regenerate] folder under ~/.claude/projects, or a path to it")
     ap.add_argument("--out", help="output Markdown file (default: ./claude-history.md)")
-    ap.add_argument("--machine", action="store_true",
-                    help="suffix the output filename with this machine's hostname "
-                         "(e.g. claude-history-macbook.md) so multiple computers "
-                         "committing to the same repo never collide")
     ap.add_argument("--title", help="display name in the doc header (default: derived from project)")
     ap.add_argument("--full-response", action="store_true", help="include all assistant text, not just the final answer")
     ap.add_argument("--list", action="store_true", help="list available project folders and exit")
