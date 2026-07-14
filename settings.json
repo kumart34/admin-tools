@@ -1,0 +1,12 @@
+{
+  "effortLevel": "max",
+  "model": "fable",
+  "hooks": {
+    "Stop": [
+      { "hooks": [
+        { "type": "command",
+          "command": "python3 ~/bin/cc_history.py --append --max-mb 5 --out \"$CLAUDE_PROJECT_DIR/claude-history.md\"" }
+      ]}
+    ]
+  }
+}
